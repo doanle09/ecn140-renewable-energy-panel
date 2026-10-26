@@ -1,0 +1,766 @@
+---
+title: "Economic and Agricultural Determinants of Renewable Energy Consumption"
+author: "Doan Nhat Phong Le"
+date: "2026"
+output: html_document
+---
+```{r}
+rm(list = ls())
+
+# Run from the repository root (e.g., open this .Rmd in RStudio from the repo folder)
+wd_r <- getwd()
+
+ 
+dir.create(file.path(wd_r,"results"), showWarnings=FALSE, recursive=TRUE)
+dir.create(file.path(wd_r,"figures"), showWarnings=FALSE, recursive=TRUE)
+ 
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(modelsummary)
+library(car)
+library(sandwich)
+library(lmtest)
+library(tidyr)
+```
+
+## Set up and cleaning
+
+```{r}
+df_raw <- read_excel(
+  file.path(wd_r, "data", "data_final.xlsx"),
+  sheet = "Data", 
+  na = c("", " ", "..","NA"))
+
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+df <- df_raw %>%
+  select(
+    country   = Country,   
+    year      = Year,
+    renew     = `Renew Cons. %`,
+    ln_renew  = `ln(Renew %)`,
+    gdp_pc    = `GDP per Capita`,
+    ln_gdp_pc = `ln(GDP p.c.)`,
+    ln_gdp_sq = `ln(GDP p.c.)²`,
+    fdi       = `FDI (% GDP)`,
+    urban     = `Urban Pop (%)`,
+    trade     = `Trade (% GDP)`,
+    forest    = `Forest Area (%)`,
+    agri_land = `Agri Land (%)`,
+    arable     = `Arable Land (%)`,
+    agri_va   = `Agri VA (% GDP)`,
+    temp      = `Temp (°C)`,
+    precip    = `Precip (mm)`,
+    co2       = `CO₂ p.c.`,
+    ln_pop    = `ln(Pop)`,
+    readiness  = Readiness,
+    adapt      = `Adaptive Capacity`
+  )
+
+missing_summary <- df %>%
+  summarise(across(everything(), \(x) sum(is.na(x)))) %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(Missing_Percentage = (Missing_Count / nrow(df)) * 100) %>%
+  arrange(desc(Missing_Count))
+
+missing_by_year <- df %>%
+  mutate(total_na_in_row = rowSums(is.na(.))) %>%
+  group_by(year) %>%
+  summarise(
+    Total_Missing_Cells = sum(total_na_in_row),
+    Rows_With_Missing = sum(total_na_in_row > 0)
+  ) %>%
+  arrange(desc(Total_Missing_Cells))
+
+bad_countries <- df%>%
+  mutate(row_na = rowSums(is.na(.))) %>%
+  group_by(country) %>%
+  summarise(Total_NA = sum(row_na)) %>%
+  arrange(desc(Total_NA))
+
+df_cleaned <- df %>%
+  filter(!country %in% c("Djibouti", "Montenegro", "St. Lucia", "Myanmar", "St. Kitts and Nevis", "Equatorial Guinea"))
+
+dev_class <- df_cleaned %>%
+  group_by(country) %>%
+  summarise(avg_gdp_pc = mean(gdp_pc, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    dev_d = if_else(avg_gdp_pc >= 12476, 1L, 0L)
+  ) #based on World Bank threshold in 2015 GDP USD.
+ 
+df_cleaned <- df_cleaned %>%
+  left_join(dev_class %>% select(country, dev_d), 
+            by = "country")
+
+core_vars <- c("renew", "ln_renew","gdp_pc","ln_gdp_pc","ln_gdp_sq","fdi","urban",
+               "forest","agri_land","agri_va","arable","temp","precip",
+               "co2","ln_pop", "readiness", "adapt")
+ 
+df_clean <- df_cleaned %>% filter(if_all(all_of(core_vars), ~ !is.na(.)))
+df_dev   <- df_clean %>% filter(dev_d == 1)
+df_ing   <- df_clean %>% filter(dev_d == 0)
+ 
+cat(sprintf("N: full=%d | developed=%d | developing=%d\n\n",
+            nrow(df_cleaned), nrow(df_dev), nrow(df_ing)))
+
+df_clean <- df_clean %>%  
+  mutate(
+    # Fix negatives in Y (2 data anomalies)
+    renew   = if_else(renew < 0, NA_real_, as.numeric(renew)),
+    ln_renew   = if_else(renew < 0, NA_real_, as.numeric(ln_renew)),
+    fdi       = as.numeric(fdi),
+    ln_gdp_pc = as.numeric(ln_gdp_pc),
+    ln_gdp_sq = as.numeric(ln_gdp_sq),
+    agri_va   = as.numeric(agri_va),
+    trade     = as.numeric(trade),
+    period = cut(year,
+      breaks = c(1994, 1999, 2004, 2009, 2014, 2020),
+      labels = c("1995–99", "2000–04", "2005–09", "2010–14", "2015–20"))
+  )%>%
+  filter(if_all(all_of(core_vars), ~ !is.na(.))) %>%
+  mutate(
+    income_grp = if_else(
+      gdp_pc >= median(gdp_pc, na.rm = TRUE),
+      "High income (top 50%)", "Low/mid income (bottom 50%)"
+    ), 
+    renew_grp = if_else(
+      renew > median(renew, na.rm = TRUE),
+      "High (above median)", "Low (below median)"
+    ))
+```
+
+#EDA
+
+```{r}
+library(scales)
+library(patchwork)
+cat("Saving Figure 1...\n")
+ 
+
+th <- theme_minimal(base_size = 11) +
+  theme(plot.title    = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(size = 9, color = "grey40"),
+        plot.caption  = element_text(size = 8, color = "grey50"))
+ 
+y_mean   <- mean(df_clean$renew, na.rm = TRUE)
+y_median <- median(df_clean$renew, na.rm = TRUE)
+ 
+# 1a: Histogram
+p1a <- ggplot(df_clean, aes(x = renew)) +
+  geom_histogram(bins = 40, fill = "#1E6B3C",
+                 color = "white", linewidth = 0.3, alpha = 0.87) +
+  geom_vline(xintercept = y_mean,
+             color = "#C55A11", linewidth = 1.3, linetype = "dashed") +
+  geom_vline(xintercept = y_median,
+             color = "#2E74B5", linewidth = 1.3, linetype = "dotdash") +
+  annotate("text", x = y_mean + 2, y = Inf, vjust = 2, hjust = 0,
+           size = 3, color = "#C55A11",
+           label = sprintf("Mean = %.1f%%", y_mean)) +
+  annotate("text", x = y_median + 2, y = Inf, vjust = 3.8, hjust = 0,
+           size = 3, color = "#2E74B5",
+           label = sprintf("Median = %.1f%%", y_median)) +
+  scale_x_continuous(labels = label_number(suffix = "%")) +
+  labs(x = "Renewable energy consumption (% of total final energy)",
+       y = "Frequency",
+       title    = "(a) Distribution of Y",
+       subtitle = sprintf("N = %d obs · Skewness present → log(Y) also used",
+                          nrow(df_clean))) +
+  th
+ 
+# 1b: Log(Y) histogram
+p1b <- ggplot(df_clean, aes(x = ln_renew)) +
+  geom_histogram(bins = 40, fill = "#0F6E56",
+                 color = "white", linewidth = 0.3, alpha = 0.87) +
+  labs(x = "ln(Renewable energy consumption)",
+       y = "Frequency",
+       title    = "(b) Distribution of ln(Y)",
+       subtitle = "Log transformation reduces right skew") +
+  th
+ 
+# 1c:
+
+p1c <- ggplot(df_clean, aes(x = period, y = renew, fill = income_grp)) +
+  geom_boxplot(alpha = 0.85, outlier.size = 0.6,
+               outlier.alpha = 0.4, linewidth = 0.4,
+               position = position_dodge(width = 0.8)) +
+  scale_fill_manual(
+    values = c("High income (top 50%)"       = "#2E74B5",
+               "Low/mid income (bottom 50%)" = "#1E6B3C"),
+    labels = c("High income (top 50%)"       = "Developed",
+               "Low/mid income (bottom 50%)" = "Developing")
+  ) +
+  scale_y_continuous(labels = label_number(suffix = "%")) +
+  labs(x    = NULL,
+       y    = "Renewable energy consumption (%)",
+       fill = NULL,
+       title    = "(c) Distribution by period and income group",
+       subtitle = "Developing countries consistently higher — driven by traditional biomass") +
+  th + theme(legend.position = "bottom")
+
+# 1d: Time trend (mean + IQR)
+trend <- df_clean %>%
+  group_by(year) %>%
+  summarise(mean_y = mean(renew, na.rm = TRUE),
+            med_y  = median(renew, na.rm = TRUE),
+            q25    = quantile(renew, 0.25, na.rm = TRUE),
+            q75    = quantile(renew, 0.75, na.rm = TRUE),
+            .groups = "drop")
+ 
+p1d <- ggplot(trend, aes(x = year)) +
+  geom_ribbon(aes(ymin = q25, ymax = q75),
+              fill = "#1E6B3C", alpha = 0.15) +
+  geom_line(aes(y = mean_y, color = "Mean"),   linewidth = 2) +
+  geom_line(aes(y = med_y,  color = "Median"), linewidth = 2,
+            linetype = "dashed") +
+  scale_color_manual(values = c("Mean"="#C55A11","Median"="#2E74B5")) +
+  scale_y_continuous(labels = label_number(suffix = "%")) +
+  labs(x = "Year",
+       y = "Renewable energy consumption (%)",
+       color    = NULL,
+       title    = "(d) Global trend 1995–2020",
+       subtitle = "Shaded band = IQR") +
+  th + theme(legend.position = "bottom")
+ 
+# Save as 2×2 composite using patchwork (if available) or separately
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  fig1 <- (p1a | p1b) / (p1c | p1d)
+  ggsave(file.path(wd_r, "figures", "fig1_Y_distribution.png"),
+         fig1, width = 13, height = 9, dpi = 300)
+  cat("  → fig1_Y_distribution.png saved (2×2 composite)\n")
+} else {
+  # Save individually if patchwork not installed
+  ggsave(file.path(wd_r, "figures", "fig1a_Y_hist.png"),   p1a, width=7, height=4.5, dpi=300)
+  ggsave(file.path(wd_r, "figures", "fig1b_Y_log.png"),    p1b, width=7, height=4.5, dpi=300)
+  ggsave(file.path(wd_r, "figures", "fig1c_Y_period.png"), p1c, width=7, height=4.5, dpi=300)
+  ggsave(file.path(wd_r, "figures", "fig1d_Y_trend.png"),  p1d, width=7, height=4.5, dpi=300)
+  cat("  → fig1a–d saved individually (install patchwork for composite)\n")
+}
+ 
+```
+
+```{r}
+vars_stats <- df_clean %>%
+  select(renew, ln_gdp_pc, fdi, urban, trade,
+         forest, agri_land, agri_va,
+         temp, precip, co2, ln_pop)
+
+vars_stats <- df_clean %>%
+  select(renew, ln_gdp_pc, fdi, urban, trade,
+         forest, agri_land, agri_va,
+         temp, precip, co2, ln_pop) %>%
+  rename(
+    `Renew. energy consump. (%)`  = renew,
+    `ln GDP per capita`            = ln_gdp_pc,
+    `FDI, net inflows (% GDP)`     = fdi,
+    `Urban population (%)`         = urban,
+    `Trade (% GDP)`                = trade,
+    `Forest area (% land)`         = forest,
+    `Agri. land (% land)`          = agri_land,
+    `Agriculture VA (% GDP)`       = agri_va,
+    `Temperature (avg. °C)`        = temp,
+    `Precipitation (mm/yr)`        = precip,
+    `CO2 per capita (metric t.)`   = co2,
+    `ln Population`                = ln_pop
+  )
+
+datasummary(
+  All(vars_stats) ~ N + Mean + SD + Min + P25 + Median + P75 + Max,
+  data   = vars_stats,
+  output = file.path(wd_r, "results", "table1_summary_stats.docx"),
+  title  = "Table 1. Descriptive Statistics",
+  notes  = "N = 3,083 country-year observations. 122 countries, 1995–2020. Listwise deletion on core regressors."
+)
+```
+
+```{r}
+p2 <- ggplot(df_clean, aes(x = ln_gdp_pc, y = renew)) +
+  geom_point(alpha = 0.08, size = 0.8, color = "#2E74B5") +
+  geom_smooth(method = "lm", formula = y ~ x,
+              color = "#888780", linewidth = 1,
+              linetype = "dashed", se = FALSE) +
+  geom_smooth(method = "lm", formula = y ~ x + I(x^2),
+              color = "#C55A11", linewidth = 1,
+              se = TRUE, fill = "#FAC775", alpha = 0.5) +
+  scale_y_continuous(labels = label_number(suffix = "%")) +
+  labs(
+    x        = "ln(GDP per capita, constant 2015 USD)",
+    y        = "Renewable energy consumption (% of total final energy)",
+    title    = "Figure 2. Renewable Energy Consumption vs. Economic Development",
+    subtitle = paste0(
+      "Orange = quadratic fit ·  Gray dashed = linear\n",
+      "N = ", nrow(df_clean), " obs · 129 countries · 1995–2020"),
+    caption  = "Sources: World Bank WDI, Our World in Data."
+  ) +
+  th
+ 
+ggsave(file.path(wd_r, "figures", "fig2_EKC.png"),
+       p2, width = 8, height = 5.5, dpi = 300)
+cat("  → fig2_EKC.png saved\n")
+```
+
+```{r}
+cat("Saving Figure 3...\n")
+ 
+# 3a: Forest area (biomass channel)
+p3a <- ggplot(df_clean, aes(x = forest, y = renew)) +
+  geom_point(alpha = 0.08, size = 0.8, color = "#1E6B3C") +
+  geom_smooth(method = "lm", formula = y ~ x,
+              color = "#538135", linewidth = 1,
+              se = TRUE, fill = "#C0DD97", alpha = 0.5) +
+  scale_y_continuous(labels = label_number(suffix = "%")) +
+  labs(x = "Forest area (% of land area)",
+       y = "Renewable energy consump. (%)",
+       title    = "(a) Forest area") +
+  th
+
+print(p3a)
+```
+
+
+```{r}
+# 3b: Agriculture value added (agri economy channel)
+p3b <- ggplot(df_clean, aes(x = agri_va, y = renew)) +
+  geom_point(alpha = 0.08, size = 0.8, color = "#538135") +
+  geom_smooth(method = "lm", formula = y ~ x,
+              color = "#1E6B3C", linewidth = 1,
+              se = TRUE, fill = "#C0DD97", alpha = 0.5) +
+  scale_y_continuous(labels = label_number(suffix = "%")) +
+  labs(x = "Agriculture, value added (% of GDP)",
+       y = "Renewable energy consump. (%)",
+       title    = "(b) Agriculture VA",
+       subtitle = "Strongest predictor · r = +0.443***") +
+  th
+
+print(p3b)
+```
+
+
+```{r}
+# 3c: Income group trend (heterogeneity preview)
+trend_inc <- df_clean %>%
+  group_by(year, income_grp)%>%
+  summarise(mean_y = mean(renew, na.rm = TRUE), .groups = "drop")
+ 
+p3c <- ggplot(trend_inc, aes(x = year, y = mean_y,
+                              color = income_grp, group = income_grp)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  scale_color_manual(values = c(
+    "High income (top 50%)"       = "#2E74B5",
+    "Low/mid income (bottom 50%)" = "#1E6B3C")) +
+  scale_y_continuous(labels = label_number(suffix = "%")) +
+  labs(x = "Year", y = "Avg renewable energy consump. (%)",
+       color    = NULL,
+       title    = "(c) Trend by income group",
+       subtitle = "Low/mid income = more biomass renewables") +
+  th + theme(legend.position = "bottom",
+             legend.text = element_text(size = 8))
+print(p3c)
+```
+
+
+```{r}
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  fig3 <- p3a | p3b | p3c
+  ggsave(file.path(wd_r, "figures", "fig3_agri_channels.png"),
+         fig3, width = 15, height = 5, dpi = 300)
+  cat("  → fig3_agri_channels.png saved (1×3 composite)\n")
+} else {
+  ggsave(file.path(wd_r, "figures", "fig3a_forest.png"),    p3a, width=6, height=4.5, dpi=300)
+  ggsave(file.path(wd_r, "figures", "fig3b_agri_va.png"),   p3b, width=6, height=4.5, dpi=300)
+  ggsave(file.path(wd_r, "figures", "fig3c_income.png"),    p3c, width=6, height=4.5, dpi=300)
+  cat("  → fig3a–c saved individually\n")
+}
+```
+
+```{r}
+all_vars <- c(
+  "renew", "ln_gdp_pc", "fdi", "urban", "trade",
+  "forest", "agri_land", "arable", "agri_va",
+  "temp", "precip", "co2", "ghg", "ln_pop",
+  "readiness", "adapt"
+)
+ 
+var_labels <- c(
+  "renew"     = "Renew Consump %",
+  "ln_gdp_pc" = "ln(GDP p.c.)",
+  "fdi"       = "FDI % GDP",
+  "urban"     = "Urban pop %",
+  "trade"     = "Trade % GDP",
+  "forest"    = "Forest area %",
+  "agri_land" = "Agri land %",
+  "arable"    = "Arable land %",
+  "agri_va"   = "Agri VA % GDP",
+  "temp"      = "Temperature",
+  "precip"    = "Precipitation",
+  "co2"       = "CO₂ p.c.",
+  "ghg"       = "GHG p.c.",
+  "ln_pop"    = "ln(Pop)",
+  "readiness" = "Readiness",
+  "adapt"     = "Adaptive cap."
+)
+ 
+vars_ok <- all_vars[all_vars %in% names(df_clean)]
+labels_ok <- var_labels[vars_ok]
+n_vars <- length(vars_ok)
+
+compute_corr <- function(data, vars, method = "pearson") {
+  n <- length(vars)
+  R  <- matrix(NA_real_, n, n)
+  Pv <- matrix(NA_real_, n, n)
+  
+  for (i in seq_len(n)) {
+    for (j in seq_len(n)) {
+      if (i == j) {
+        R[i, j]  <- 1.0
+        Pv[i, j] <- 0.0
+        next
+      }
+      sub <- data %>%
+        select(all_of(c(vars[i], vars[j]))) %>%
+        drop_na()
+      
+      if (nrow(sub) < 10) next
+      
+      test <- suppressWarnings(  # ← phải nằm ở đây, bao quanh cor.test
+        cor.test(sub[[1]], sub[[2]], method = method)
+      )
+      R[i, j]  <- test$estimate
+      Pv[i, j] <- test$p.value
+    }
+  }
+  return(list(R = R, Pv = Pv))
+}
+ 
+pearson  <- compute_corr(df_clean, vars_ok, "pearson")
+spearman <- compute_corr(df_clean, vars_ok, "spearman")
+ 
+
+make_long <- function(R_mat, Pv_mat, var_labels) {
+  n <- nrow(R_mat)
+  expand.grid(
+    Var1 = factor(var_labels, levels = rev(var_labels)),
+    Var2 = factor(var_labels, levels = var_labels),
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(
+      i    = as.integer(Var1),   # reversed
+      j    = as.integer(Var2),
+      i_r  = n + 1 - i,          # actual row index
+      r    = mapply(function(a, b) R_mat[a, b],  i_r, j),
+      pv   = mapply(function(a, b) Pv_mat[a, b], i_r, j),
+      stars = case_when(
+        is.na(pv)  ~ "",
+        pv < 0.001 ~ "***",
+        pv < 0.01  ~ "**",
+        pv < 0.05  ~ "*",
+        TRUE       ~ ""
+      ),
+      label = if_else(
+        i_r == j,
+        "1.00",
+        if_else(!is.na(r), sprintf("%.2f%s", r, stars), "")
+      ),
+      text_color = if_else(abs(r) > 0.55 | i_r == j,
+                           "white", "grey15")
+    )
+}
+ 
+df_pearson  <- make_long(pearson$R,  pearson$Pv,  labels_ok)
+df_spearman <- make_long(spearman$R, spearman$Pv, labels_ok)
+ 
+ 
+# =============================================================
+# FIGURE 3 — HELPER: one heatmap panel
+# =============================================================
+ 
+# Colormap: blue (−1) → white (0) → teal (1)
+corr_colors <- c(
+  "#0D4A8A", "#185FA5", "#2E74B5", "#6AAED6",
+  "#C7E4F0", "#FFFFFF",
+  "#9FE1CB", "#5DCAA5", "#1D9E75", "#0A4027"
+)
+ 
+make_corr_panel <- function(df_long, title_text) {
+  ggplot(df_long, aes(x = Var2, y = Var1, fill = r)) +
+    geom_tile(color = "white", linewidth = 0.35) +
+    geom_text(
+      aes(label = label, color = text_color),
+      size = 2.15, fontface = "bold"
+    ) +
+    scale_fill_gradientn(
+      colors   = corr_colors,
+      limits   = c(-1, 1),
+      na.value = "#F0F0F0",
+      name     = NULL,
+      guide    = guide_colorbar(
+        barwidth = 0.8, barheight = 12,
+        ticks    = TRUE,
+        frame.colour = "grey70"
+      )
+    ) +
+    scale_color_identity() +
+    scale_x_discrete(position = "bottom") +
+    labs(title = title_text, x = NULL, y = NULL) +
+    theme_minimal(base_size = 9) +
+    theme(
+      axis.text.x     = element_text(angle = 45, hjust = 1,
+                                     size = 7.5, color = "grey25"),
+      axis.text.y     = element_text(size = 7.5, color = "grey25"),
+      panel.grid      = element_blank(),
+      plot.title      = element_text(face = "bold", size = 10.5,
+                                     hjust = 0.5, color = "#1F3864"),
+      legend.position = "right",
+      legend.text     = element_text(size = 7.5),
+      plot.margin     = margin(4, 4, 4, 4)
+    )
+}
+ 
+p_pearson  <- make_corr_panel(df_pearson,  "Pearson r")
+p_spearman <- make_corr_panel(df_spearman, "Spearman ρ")
+ 
+fig3 <- (p_pearson | p_spearman) +
+  plot_annotation(
+    title    = "Fig 4 — Correlation Matrix  |  Pearson (left) · Spearman (right)",
+    subtitle = "*** p<0.001  ** p<0.01  * p<0.05",
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 13,
+                                   hjust = 0.5, color = "#1F3864"),
+      plot.subtitle = element_text(size = 9, hjust = 0.5,
+                                   color = "grey40")
+    )
+  )
+ 
+ggsave(
+  file.path(wd_r, "figures", "fig4_correlation.png"),
+  fig3, width = 20, height = 9, dpi = 300
+)
+cat("fig4_correlation.png saved\n")
+ 
+```
+
+```{r}
+x_vars <- vars_ok[vars_ok != "renew"]   # exclude Y
+x_lbls <- labels_ok[x_vars]
+n_x    <- length(x_vars)
+ 
+x_pearson <- compute_corr(df_clean, x_vars, "pearson")
+ 
+df_x_long <- expand.grid(
+  Var1 = factor(x_lbls, levels = rev(x_lbls)),
+  Var2 = factor(x_lbls, levels = x_lbls),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    i   = as.integer(Var1),
+    j   = as.integer(Var2),
+    i_r = n_x + 1 - i,
+    r   = mapply(function(a, b) x_pearson$R[a, b],  i_r, j),
+    pv  = mapply(function(a, b) x_pearson$Pv[a, b], i_r, j),
+    # Flag high collinearity (|r| > 0.70, off-diagonal)
+    flag = abs(r) >= 0.70 & i_r != j,
+    label = case_when(
+      i_r == j                    ~ "1.00",
+      is.na(r)                    ~ "",
+      abs(r) >= 0.70 & i_r != j  ~ sprintf("%.2f△", r),
+      TRUE                         ~ sprintf("%.2f", r)
+    ),
+    text_color = case_when(
+      i_r == j      ~ "white",
+      abs(r) > 0.55 ~ "white",
+      TRUE           ~ "grey20"
+    ),
+    text_bold  = if_else(abs(r) >= 0.70 | i_r == j,
+                         "bold", "plain")
+  )
+ 
+# Diverging colormap: blue → white → red/orange
+multicoll_colors <- c(
+  "#0D4A8A","#2E74B5","#6AAED6","#C7E4F0",
+  "#FFFFFF",
+  "#FDD49E","#F5A05A","#D85A30","#A62200"
+)
+ 
+fig5 <- ggplot(df_x_long, aes(x = Var2, y = Var1, fill = r)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  # Normal labels
+  geom_text(
+    data = df_x_long %>% filter(!flag, i_r != j),
+    aes(label = label, color = text_color),
+    size = 2.8
+  ) +
+  # Diagonal "1.00"
+  geom_text(
+    data = df_x_long %>% filter(i_r == j),
+    aes(label = label),
+    color = "white", size = 2.8, fontface = "bold"
+  ) +
+  # High collinearity labels (bold, with △ flag)
+  geom_text(
+    data = df_x_long %>% filter(flag),
+    aes(label = label, color = text_color),
+    size = 2.8, fontface = "bold"
+  ) +
+  scale_fill_gradientn(
+    colors   = multicoll_colors,
+    limits   = c(-1, 1),
+    na.value = "#F0F0F0",
+    name     = "Pearson r",
+    guide    = guide_colorbar(
+      barwidth = 0.8, barheight = 14,
+      ticks    = TRUE,
+      frame.colour = "grey70"
+    )
+  ) +
+  scale_color_identity() +
+  scale_x_discrete(position = "bottom") +
+  labs(
+    title    = "Fig 5 — Multicollinearity Check: Pairwise Correlations Among Regressors",
+    subtitle = "High |r| > 0.7 may indicate collinearity issues",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1,
+                                   size = 9, color = "grey25"),
+    axis.text.y     = element_text(size = 9, color = "grey25"),
+    panel.grid      = element_blank(),
+    plot.title      = element_text(face = "bold", size = 12,
+                                   hjust = 0.5, color = "#1F3864"),
+    plot.subtitle   = element_text(size = 9.5, hjust = 0.5,
+                                   color = "grey40"),
+    legend.position = "right",
+    legend.title    = element_text(size = 9),
+    legend.text     = element_text(size = 8.5)
+  )
+ 
+ggsave(
+  file.path(wd_r, "figures", "fig5_multicollinearity.png"),
+  fig5, width = 11, height = 10, dpi = 300
+)
+cat("fig5_multicollinearity.png saved\n")
+ 
+```
+
+##MODELING
+```{r}
+library(lmtest)
+library(sandwich)
+library(modelsummary)
+
+fml_ols <- renew ~ ln_gdp_pc + ln_gdp_sq + fdi + urban +
+  forest + agri_land + agri_va +
+  temp + precip + co2 + ln_pop
+ 
+fml_fe <- renew ~ ln_gdp_pc + ln_gdp_sq + fdi + urban +
+  agri_va + co2 + ln_pop
+ 
+fml_log <- ln_renew ~ ln_gdp_pc + ln_gdp_sq + fdi + urban +
+  agri_va + co2 + ln_pop
+
+
+m_ols <- lm(fml_ols, data = df_clean)
+
+summary(m_ols) 
+coeftest(m_ols, vcov. = vcovCL(m_ols, cluster = ~ country, type = "HC1"))
+
+print(linearHypothesis(m_ols, c("ln_gdp_pc = 0", "ln_gdp_sq = 0"),
+                       vcov. = vcovHC(m_ols, type = "HC1")))
+print(linearHypothesis(m_ols,
+                       c("forest = 0", "agri_land = 0", "agri_va = 0"),
+                       vcov. = vcovHC(m_ols, type = "HC1")))
+```
+
+```{r}
+library(plm)
+m_fe <- plm(fml_fe,
+           data   = df_clean,
+           model  = "within",
+           index =c("country", "year"), 
+           effect = "twoways")
+summary(m_fe)
+
+print(linearHypothesis(m_fe,
+                       c("ln_gdp_pc = 0", "ln_gdp_sq = 0"),
+                       vcov. = vcovHC(m_fe, type = "HC1")))
+
+```
+
+```{r}
+library(plm)
+m_fd <- plm(fml_fe,
+           data  = df_clean,
+           model = "fd", 
+           index =c("country", "year"))
+summary(m_fd)
+coeftest(m_fd, vcov. = vcovHC(m_fd, type = "HC1"))
+```
+
+```{r}
+df_dev <- df_dev %>% mutate(fdi = as.numeric(fdi))
+df_ing <- df_ing %>% mutate(fdi = as.numeric(fdi))
+m4_dev <- plm(fml_fe,
+              data   = df_dev,
+              model  = "within",
+              index =c("country", "year"),
+              effect = "twoways")
+
+m4_ing <- plm(fml_fe,
+              data   = df_ing,
+              model  = "within",
+              index =c("country", "year"),
+              effect = "twoways")
+
+summary (m4_dev)
+summary (m4_ing)
+```
+
+```{r}
+m5 <- plm(
+  renew ~ ln_gdp_pc + ln_gdp_sq + fdi + urban +
+    agri_va + co2 + ln_pop +
+    dev_d:ln_gdp_pc + 
+    dev_d:agri_va,         
+  data   = df_clean,
+  model  = "within",
+  index =c("country", "year"),
+  effect = "twoways"
+)
+
+summary (m5)
+print(linearHypothesis(m5,
+                       c("ln_gdp_pc:dev_d = 0", "agri_va:dev_d = 0"),
+                       vcov. = vcovHC(m5, type = "HC1")))
+```
+
+
+```{r, warning=FALSE}
+library(modelsummary)
+
+modelsummary(
+  list("OLS"        = m_ols,
+       "Two-Way FE" = m_fe,
+       "FD"         = m_fd,
+       "Dev FE"     = m4_dev,
+       "Ing FE"     = m4_ing),
+   vcov = list(
+    function(m) vcovHC(m, type = "HC1"),  
+    vcov(m_fe),                         
+    vcov(m_fd),                        
+    vcov(m4_dev),                        
+    vcov(m4_ing)                         
+  ),  
+  stars   = c("*" = 0.1, "**" = 0.05, "***" = 0.01),
+  fmt     = 3,
+  gof_omit = "AIC|BIC|Log.Lik|RMSE",
+  output  = file.path(wd_r, "results", "table_main1.docx")
+)
+
+
+```
+
